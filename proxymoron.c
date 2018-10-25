@@ -72,10 +72,15 @@ struct job {
     struct endpoint client, backend;
 };
 
-static void streambuf_consume(struct streambuf *streambuf, size_t amount) {
+// Advance the current data location / consume a block of data.
+// Avoid doing small advances; repeated small advances are inefficient.
+static void streambuf_advance(struct streambuf *streambuf, size_t amount) {
     assert(amount <= streambuf->len);
 
     streambuf->len -= amount;
+
+    if (streambuf->len == 0)
+        return; // nothing else to do :)
 
     memmove(streambuf->data, streambuf->data + amount, streambuf->len);
 }
