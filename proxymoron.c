@@ -1,29 +1,25 @@
 /*
- * Copyright 2007  Quest Software, Inc.
- * All rights reserved.
- * Copyright 2018  Ted Percival <ted@tedp.id.au>
+ * MIT License
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright
- *       notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in the
- *       documentation and/or other materials provided with the distribution.
- *     * Neither the name of Quest Software, Inc. nor the
- *       names of its contributors may be used to endorse or promote products
- *       derived from this software without specific prior written permission.
+ * Copyright 2018 Ted Percival
  *
- * THIS SOFTWARE IS PROVIDED BY QUEST SOFTWARE, INC "AS IS" AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL QUEST SOFTWARE, INC BE LIABLE FOR ANY
- * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #define _GNU_SOURCE 1
@@ -50,10 +46,10 @@
 // If undefined, automatically uses all CPUs.
 #define NCPUS 1
 
-static void die(const char *cause) __attribute__((noreturn));
-void die(const char *cause) {
-    perror(cause);
-    exit(1);
+__attribute__((noreturn))
+static void fatal_perror(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
 struct streambuf {
@@ -374,7 +370,7 @@ static void subscribe(int epfd, int fd) {
     };
 
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event) == -1)
-        die("epoll_ctl subscribe");
+        fatal_perror("epoll_ctl subscribe");
 }
 
 static int get_backend_fd(int epfd, struct connection_pool *pool) {
@@ -923,7 +919,7 @@ static void reuseport(int sock) {
 static int server_socket(void) {
     int sock = socket(PF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (sock == -1)
-        die("socket");
+        fatal_perror("socket");
 
     reuseport(sock);
 
@@ -936,7 +932,7 @@ static int server_socket(void) {
     };
 
     if (bind(sock, (const struct sockaddr*)&bind_addr, sizeof(bind_addr)) == -1)
-        die("bind");
+        fatal_perror("bind");
 
     // This is slightly slower in this case, but probably want to enable it on a
     // real server. Might be faster once we do an immediate read on a new
@@ -948,20 +944,20 @@ static int server_socket(void) {
     enable_fastopen(sock);
 
     if (listen(sock, 1000) == -1)
-        die("listen");
+        fatal_perror("listen");
 
     return sock;
 }
 
 static void quiesce_signals(void) {
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
-        die("signal(SIGPIPE)");
+        fatal_perror("signal(SIGPIPE)");
 }
 
 static int setup_epoll_fd(int listen_sock) {
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1)
-        die("epoll_create");
+        fatal_perror("epoll_create");
 
     struct epoll_event event = {
         .events = EPOLLIN,
@@ -974,14 +970,14 @@ static int setup_epoll_fd(int listen_sock) {
     };
 
     if (event.data.ptr == NULL)
-        die("Failed to create epoll wrapper for listen socket");
+        fatal_perror("Failed to create epoll wrapper for listen socket");
 
 #if defined(EPOLLEXCLUSIVE)
     event.events |= EPOLLEXCLUSIVE;
 #endif
 
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &event) == -1)
-        die("epoll_ctl add");
+        fatal_perror("epoll_ctl add");
 
     return epfd;
 }
@@ -992,7 +988,7 @@ static void event_loop_iteration(int epfd, int listen_sock) {
     int count = epoll_wait(epfd, events, sizeof(events) / sizeof(events[0]), -1);
 
     if (count == -1)
-        die("epoll_wait");
+        fatal_perror("epoll_wait");
 
     if (count == 0)
         return;
@@ -1006,24 +1002,22 @@ static void event_loop(int epfd, int listen_sock) {
         event_loop_iteration(epfd, listen_sock);
 }
 
-int main(int argc, char *argv[]) {
-    quiesce_signals();
-
-    multiply();
-
-    int sock = server_socket();
-
-    int epfd = setup_epoll_fd(sock);
+static int serve(void) {
+    int s = server_socket();
+    int epfd = setup_epoll_fd();
 
     setup_connection_pool(&backend_pool);
 
-    event_loop(epfd, sock);
+    event_loop(epfd, s);
 
     close(epfd);
-    close(sock);
+    close(s);
 
-    return 0;
+    return EXIT_SUCCESS;
 }
 
-/* vim: ts=4 sw=4 et
- */
+int main(void) {
+    quiesce_signals();
+    multiply();
+    return serve();
+}
