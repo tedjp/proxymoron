@@ -55,6 +55,20 @@ static void fatal_perror(const char *msg) {
     exit(EXIT_FAILURE);
 }
 
+static void cork(int sock, bool whether) {
+    const int value = whether ? 1 : 0;
+    if (setsockopt(sock, IPPROTO_TCP, TCP_CORK, &value, sizeof(value)) == -1)
+        perror("setsockopt(TCP_CORK)");
+}
+
+static void tcp_cork(int sock) {
+    cork(sock, true);
+}
+
+static void tcp_uncork(int sock) {
+    cork(sock, false);
+}
+
 struct streambuf {
     char *data;
     size_t len;
@@ -309,8 +323,12 @@ static int job_terminate_headers(struct job *job) {
 }
 
 static int job_respond_status_only(struct job *job, int code, const char *msg) {
+    int rc = -1;
+
+    tcp_cork(job->client.fd);
+
     if (job_send_status(job, code, msg) == -1)
-        return -1;
+        goto cleanup;
 
     const size_t msglen = strlen(msg);
 
@@ -320,21 +338,25 @@ static int job_respond_status_only(struct job *job, int code, const char *msg) {
             "Content-Length: %zu\r\n", msglen + 1);
     if (len != -1 && len != sizeof(content_headers)) {
         if (endpoint_send(&job->client, content_headers, len) == -1)
-            return -1;
+            goto cleanup;
     }
 
     if (job_terminate_headers(job) == -1)
-        return -1;
+        goto cleanup;
 
     if (endpoint_send(&job->client, msg, msglen) == -1)
-        return -1;
+        goto cleanup;
 
     const char nl = '\n';
 
     if (endpoint_send(&job->client, &nl, sizeof(nl)) == -1)
-        return -1;
+        goto cleanup;
 
-    return 0;
+    rc = 0;
+
+cleanup:
+    tcp_uncork(job->client.fd);
+    return rc;
 }
 
 static struct job *new_job(int client) {
