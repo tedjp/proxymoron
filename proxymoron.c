@@ -312,7 +312,26 @@ static int job_respond_status_only(struct job *job, int code, const char *msg) {
     if (job_send_status(job, code, msg) == -1)
         return -1;
 
+    const size_t msglen = strlen(msg);
+
+    char content_headers[256];
+    int len = snprintf(content_headers, sizeof(content_headers),
+            "Content-Type: text/plain; charset=us-ascii\r\n"
+            "Content-Length: %zu\r\n", msglen + 1);
+    if (len != -1 && len != sizeof(content_headers)) {
+        if (endpoint_send(&job->client, content_headers, len) == -1)
+            return -1;
+    }
+
     if (job_terminate_headers(job) == -1)
+        return -1;
+
+    if (endpoint_send(&job->client, msg, msglen) == -1)
+        return -1;
+
+    const char nl = '\n';
+
+    if (endpoint_send(&job->client, &nl, sizeof(nl)) == -1)
         return -1;
 
     return 0;
