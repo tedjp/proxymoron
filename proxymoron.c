@@ -241,6 +241,7 @@ static ssize_t streambuf_recv(struct streambuf *sb, int fd, ssize_t limit) {
         if (len <= 0) {
             if (sb->len > 0)
                 return sb->len;
+
             return len;
         }
 
@@ -281,6 +282,7 @@ static ssize_t endpoint_send(struct endpoint *ep, const void *data, size_t data_
     return data_len;
 }
 
+// Remember to check for EAGAIN/EWOULDBLOCK when this returns -1.
 static ssize_t endpoint_recv(struct endpoint *ep, ssize_t limit) {
     return streambuf_recv(&ep->incoming, ep->fd, limit);
 }
@@ -670,6 +672,8 @@ static bool send_backend_request(int epfd, struct job *job) {
 static void to_next_state(int epfd, struct job *job);
 
 static void on_client_input(int epfd, struct job *job) {
+    // FIXME: RECV_NO_LIMIT allows a client to push more data than we can keep
+    // up with, and exhaust memory.
     ssize_t len = endpoint_recv(&job->client, RECV_NO_LIMIT);
     if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         perror("recv");
@@ -702,6 +706,7 @@ static void on_client_input(int epfd, struct job *job) {
             return;
         }
 
+        // remains in client_read state; re-arm epoll
         to_next_state(epfd, job);
         return;
     }
@@ -842,7 +847,7 @@ static void read_backend_response(int epfd, struct job *job) {
     }
 
     if (len == -1) {
-        fprintf(stderr, "Backend fd %d was trash; replacing\n", job->backend.fd);
+        fprintf(stderr, "Backend fd %d was trash (%s); replacing\n", job->backend.fd, strerror(errno));
         delete_backend_fd(epfd, &backend_pool, job->backend.fd);
         job->backend.fd = get_backend_fd(epfd, &backend_pool);
 
@@ -985,7 +990,6 @@ static void on_hup_or_error(int epfd, const struct epoll_event *event) {
         return;
     }
 
-    fprintf(stderr, "Client closed connection\n");
     close_job(epfd, job);
 }
 
