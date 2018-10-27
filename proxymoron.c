@@ -532,14 +532,24 @@ static void free_job_later(struct job *job) {
 }
 
 static void close_job(int epfd, struct job *job) {
-    if (job->client.fd != -1)
+    if (job->client.fd != -1) {
         unsubscribe(epfd, job->client.fd);
+        close(job->client.fd);
+        job->client.fd = -1;
+    }
 
-    if (job->backend.fd != -1)
-        unsubscribe(epfd, job->backend.fd);
+    endpoint_free_contents(&job->client);
+
+    if (job->backend.fd != -1) {
+        // Kill the backend connection, it's the only way to cancel the
+        // request in HTTP/1.1. Waiting for it and draining it is a waste
+        // of time (potentially bigger).
+        delete_backend_fd(epfd, &backend_pool, job->backend.fd);
+        close(job->backend.fd);
+        job->backend.fd = -1;
+    }
 
     endpoint_free_contents(&job->backend);
-    endpoint_free_contents(&job->client);
 
     free_job_later(job);
 }
@@ -855,22 +865,6 @@ static void read_backend_response(int epfd, struct job *job) {
     write_client_response(epfd, job);
 }
 
-static void close_client(int epfd, struct job *job) {
-    unsubscribe(epfd, job->client.fd);
-    endpoint_free_contents(&job->client);
-
-    if (job->backend.fd != -1) {
-        // Kill the backend connection, it's the only way to cancel the
-        // request in HTTP/1.1. Waiting for it and draining it is a waste
-        // of time (potentially bigger).
-        delete_backend_fd(epfd, &backend_pool, job->backend.fd);
-        close(job->backend.fd);
-        job->backend.fd = -1;
-    }
-
-    endpoint_free_contents(&job->backend);
-}
-
 static void read_event(int epfd, struct job *job) {
     switch (job_state(job)) {
     case FRONTEND_READ_WAIT:
@@ -943,6 +937,25 @@ static void new_client(int epfd, struct job *listen_job) {
     on_client_input(epfd, job);
 }
 
+static void on_hup_or_error(int epfd, const struct epoll_event *event) {
+    struct job *job = event->data.ptr;
+
+    if (job->backend.fd != -1) {
+        delete_backend_fd(epfd, &backend_pool, job->backend.fd);
+
+        if (job_respond_status_only(job, 503, "Backend connection lost") == -1) {
+            close_job(epfd, job);
+            return;
+        }
+
+        to_next_state(epfd, job);
+        return;
+    }
+
+    fprintf(stderr, "Client closed connection\n");
+    close_job(epfd, job);
+}
+
 static void dispatch(int epfd, const struct epoll_event *event, int listensock) {
     if (event->events & EPOLLIN) {
         struct job *job = event->data.ptr;
@@ -956,11 +969,8 @@ static void dispatch(int epfd, const struct epoll_event *event, int listensock) 
     if (event->events & EPOLLOUT)
         write_event(epfd, event);
 
-    // FIXME: This will kill off a client if the backend connection dies.
-    if ((event->events & EPOLLHUP) || (event->events & EPOLLERR)) {
-        close_client(epfd, event->data.ptr);
-        return;
-    }
+    if ((event->events & EPOLLHUP) || (event->events & EPOLLERR))
+        on_hup_or_error(epfd, event);
 }
 
 static void multiply() {
