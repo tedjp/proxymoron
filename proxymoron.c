@@ -765,10 +765,17 @@ static ssize_t transform_response_body(struct streambuf *buf) {
     const char to[] = "http://hahaha.com";
     const size_t tolen = sizeof(to) - 1;
 
-    if (tolen > fromlen)
-        streambuf_ensure_capacity(buf, tolen - fromlen);
+    if (tolen > fromlen) {
+        if (streambuf_ensure_capacity(buf, tolen - fromlen) < 0)
+            return -1;
+    }
 
-    return replace_string(buf->data, buf->len, buf->cap, from, fromlen, to, tolen);
+    ssize_t new_len = replace_string(buf->data, buf->len, buf->cap, from, fromlen, to, tolen);
+
+    if (new_len >= 0)
+        buf->len = new_len;
+
+    return new_len;
 }
 
 static ssize_t make_response_header(char *buf, size_t buflen, size_t content_length) {
