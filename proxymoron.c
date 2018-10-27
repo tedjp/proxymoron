@@ -857,8 +857,10 @@ static void read_backend_response(int epfd, struct job *job) {
         return;
     }
 
-    if (len == -1) {
-        fprintf(stderr, "Backend fd %d was trash (%s); replacing\n", job->backend.fd, strerror(errno));
+    if (len == -1 || len == 0) {
+        fprintf(stderr, "Backend fd %d was trash (%s); replacing\n",
+                job->backend.fd,
+                len == 0 ? "connection closed" : strerror(errno));
         delete_backend_fd(epfd, &backend_pool, job->backend.fd);
         job->backend.fd = get_backend_fd(epfd, &backend_pool);
 
