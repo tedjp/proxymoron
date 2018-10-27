@@ -47,6 +47,7 @@
 #define NCPUS 1
 
 #define MAX_REQUEST_SIZE 65536
+#define MAX_PIPELINED_REQUEST_DATA (MAX_REQUEST_SIZE * 4)
 
 __attribute__((noreturn))
 static void fatal_perror(const char *msg) {
@@ -283,6 +284,8 @@ static ssize_t endpoint_send(struct endpoint *ep, const void *data, size_t data_
 }
 
 // Remember to check for EAGAIN/EWOULDBLOCK when this returns -1.
+// If you set a limit, make sure you don't retry indefinitely because of data
+// waiting on the socket that you're not willing to read.
 static ssize_t endpoint_recv(struct endpoint *ep, ssize_t limit) {
     return streambuf_recv(&ep->incoming, ep->fd, limit);
 }
@@ -672,9 +675,7 @@ static bool send_backend_request(int epfd, struct job *job) {
 static void to_next_state(int epfd, struct job *job);
 
 static void on_client_input(int epfd, struct job *job) {
-    // FIXME: RECV_NO_LIMIT allows a client to push more data than we can keep
-    // up with, and exhaust memory.
-    ssize_t len = endpoint_recv(&job->client, RECV_NO_LIMIT);
+    ssize_t len = endpoint_recv(&job->client, MAX_PIPELINED_REQUEST_DATA);
     if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         perror("recv");
         close_job(epfd, job);
@@ -687,13 +688,23 @@ static void on_client_input(int epfd, struct job *job) {
         return;
     }
 
+    if (len == MAX_PIPELINED_REQUEST_DATA) {
+        if (job_respond_status_only(job, 413, "Requests too big") == -1) {
+            close_job(epfd, job);
+            return;
+        }
+
+        close_job(epfd, job);
+        return;
+    }
+
     // Beware that there might be a stack of pipelined requests waiting, so it's
     // inappropriate to reject the connection for sending a request that's too
     // big until we're sure it hasn't finished describing a single request yet.
     char *end_of_request_header = find_end_of_header(job->client.incoming.data, job->client.incoming.len);
     if (end_of_request_header == NULL) {
         if (job->client.incoming.len > MAX_REQUEST_SIZE) {
-            if (job_respond_status_only(job, 400, "Request too big") == -1) {
+            if (job_respond_status_only(job, 413, "Request too big") == -1) {
                 close_job(epfd, job);
                 return;
             }
