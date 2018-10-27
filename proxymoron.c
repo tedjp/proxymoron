@@ -514,6 +514,9 @@ struct free_job_node {
 struct free_job_node *free_jobs = NULL;
 
 static void free_closed_jobs() {
+    if (free_jobs == NULL)
+        return;
+
     struct free_job_node *next = NULL;
 
     for (struct free_job_node *n = free_jobs; n != NULL; n = next) {
@@ -560,6 +563,7 @@ static void ep_mod_or_cleanup(int epfd, int fd, struct epoll_event *event) {
         perror("epoll_ctl MOD EPOLLOUT");
         // This call might print spurious errors, but it's better than leaking.
         close_job(epfd, (struct job*)event->data.ptr);
+        return;
     }
 }
 
@@ -742,6 +746,8 @@ static void state_to_client_read(int epfd, struct job *job) {
 }
 
 static void to_next_state(int epfd, struct job *job) {
+    assert(job->client.fd != -1);
+
     switch (job_state(job)) {
     case FRONTEND_WRITE_WAIT:
         state_to_client_write(epfd, job);
@@ -834,8 +840,10 @@ static void read_backend_response(int epfd, struct job *job) {
 
         // resend backend request on new connection
         if (send_backend_request(epfd, job) == false) {
-            if (job_respond_status_only(job, 503, "Backend request failed again") == -1)
+            if (job_respond_status_only(job, 503, "Backend request failed again") == -1) {
                 close_job(epfd, job);
+                return;
+            }
         }
 
         to_next_state(epfd, job);
@@ -882,9 +890,8 @@ static void read_event(int epfd, struct job *job) {
         read_backend_response(epfd, job);
         break;
     default:
-        // Probably EPOLLERR
-        fprintf(stderr, "incoming data available but none expected, client fd %d, backend fd %d\n", job->client.fd, job->backend.fd);
-        close_job(epfd, job);
+        abort();
+        return;
     }
 }
 
@@ -972,10 +979,15 @@ static void dispatch(int epfd, const struct epoll_event *event, int listensock) 
             new_client(epfd, job);
         else
             read_event(epfd, job);
+    } else if (event->events & EPOLLOUT) {
+        write_event(epfd, event);
     }
 
-    if (event->events & EPOLLOUT)
-        write_event(epfd, event);
+    struct job *job = event->data.ptr;
+    if (job->client.fd == -1) {
+        // Client already closed
+        return;
+    }
 
     if ((event->events & EPOLLHUP) || (event->events & EPOLLERR))
         on_hup_or_error(epfd, event);
