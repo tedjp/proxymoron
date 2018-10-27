@@ -671,7 +671,14 @@ static void to_next_state(int epfd, struct job *job);
 
 static void on_client_input(int epfd, struct job *job) {
     ssize_t len = endpoint_recv(&job->client, RECV_NO_LIMIT);
-    if (len <= 0) {
+    if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        perror("recv");
+        close_job(epfd, job);
+        return;
+    }
+
+    if (len == 0) {
+        // Client closed connection
         close_job(epfd, job);
         return;
     }
@@ -682,10 +689,15 @@ static void on_client_input(int epfd, struct job *job) {
     char *end_of_request_header = find_end_of_header(job->client.incoming.data, job->client.incoming.len);
     if (end_of_request_header == NULL) {
         if (job->client.incoming.len > MAX_REQUEST_SIZE) {
-            job_respond_status_only(job, 400, "Request too big");
-            // In this case maybe we want more of a shutdown_job
-            // function that will ensure we no longer read anything but
-            // continue to attempt to write for a short while.
+            if (job_respond_status_only(job, 400, "Request too big") == -1) {
+                close_job(epfd, job);
+                return;
+            }
+
+            // This is fairly abrupt, we try to tell the client that the request
+            // was too big, but they might not get the message if the socket
+            // wasn't ready. But they're misbehaving so we want to drop the
+            // ASAP.
             close_job(epfd, job);
             return;
         }
@@ -822,6 +834,12 @@ static void write_client_response(int epfd, struct job *job) {
 
 static void read_backend_response(int epfd, struct job *job) {
     ssize_t len = endpoint_recv(&job->backend, RECV_NO_LIMIT);
+
+    if (len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        // No data yet.
+        to_next_state(epfd, job);
+        return;
+    }
 
     if (len == -1) {
         fprintf(stderr, "Backend fd %d was trash; replacing\n", job->backend.fd);
