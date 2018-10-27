@@ -1020,8 +1020,6 @@ static void enable_defer_accept(int sock) {
     const int seconds = 2;
     if (setsockopt(sock, IPPROTO_TCP, TCP_DEFER_ACCEPT, &seconds, sizeof(seconds)) == -1)
         perror("setsockopt TCP_DEFER_ACCEPT");
-    else
-        fprintf(stderr, "TCP_DEFER_ACCEPT enabled\n");
 #endif
 }
 
