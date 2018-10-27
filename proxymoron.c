@@ -667,7 +667,7 @@ static void to_next_state(int epfd, struct job *job);
 
 static void on_client_input(int epfd, struct job *job) {
     ssize_t len = endpoint_recv(&job->client, RECV_NO_LIMIT);
-    if (len < 0) {
+    if (len <= 0) {
         close_job(epfd, job);
         return;
     }
