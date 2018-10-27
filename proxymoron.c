@@ -188,6 +188,7 @@ static int streambuf_ensure_capacity(struct streambuf *sb, size_t data_len) {
         if (!newbuf)
             return -1;
         sb->data = newbuf;
+        sb->cap = sb->len + data_len;
     }
 
     return 0;
