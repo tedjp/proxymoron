@@ -494,11 +494,11 @@ static void delete_backend_fd(int epfd, struct connection_pool *pool, int fd) {
 // Returns new length, or -1 on error
 static ssize_t replace_string(char *buf, size_t buflen, size_t bufcap, const char *from, size_t fromlen, const char *to, size_t tolen) {
     if (buflen - fromlen + tolen > bufcap)
-        return false;
+        return -1;
 
     char *location = memmem(buf, buflen, from, fromlen);
     if (location == NULL)
-        return false;
+        return -1;
 
     const size_t trailer_len = buflen - (location - buf) - fromlen;
 
