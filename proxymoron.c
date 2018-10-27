@@ -868,25 +868,36 @@ static ssize_t make_response_header(char *buf, size_t buflen, size_t content_len
 }
 
 static void write_client_response(int epfd, struct job *job) {
+    tcp_cork(job->client.fd);
+
     char header_buf[4096];
+    bool ok = false;
     ssize_t len = make_response_header(header_buf, sizeof(header_buf), job->backend.incoming.len);
     if (!len) {
-        job_respond_status_only(job, 500, "Failed to render response header");
+        if (job_respond_status_only(job, 500, "Failed to render response header") == -1)
+            goto cleanup;
+
+        // managed to inform the client that we had a problem,
+        // so don't disconnect the client.
+        ok = true;
+        goto cleanup;
+    }
+
+    if (endpoint_send(&job->client, header_buf, len) == -1)
+        goto cleanup;
+
+    if (endpoint_send(&job->client, job->backend.incoming.data, job->backend.incoming.len) == -1)
+        goto cleanup;
+
+    ok = true;
+
+cleanup:
+    tcp_uncork(job->client.fd);
+
+    if (ok)
         to_next_state(epfd, job);
-        return;
-    }
-
-    if (endpoint_send(&job->client, header_buf, len) == -1) {
+    else
         close_job(epfd, job);
-        return;
-    }
-
-    if (endpoint_send(&job->client, job->backend.incoming.data, job->backend.incoming.len) == -1) {
-        close_job(epfd, job);
-        return;
-    }
-
-    to_next_state(epfd, job);
 }
 
 static void read_backend_response(int epfd, struct job *job) {
