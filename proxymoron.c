@@ -187,6 +187,7 @@ static int streambuf_ensure_capacity(struct streambuf *sb, size_t data_len) {
         char *newbuf = realloc(sb->data, sb->len + data_len);
         if (!newbuf)
             return -1;
+        sb->data = newbuf;
     }
 
     return 0;
