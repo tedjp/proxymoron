@@ -224,10 +224,10 @@ static ssize_t streambuf_recv(struct streambuf *sb, int fd, ssize_t limit) {
     do {
         size_t new_capacity;
 
-        if (sb->cap < 4096)
+        if (sb->len < 4096)
             new_capacity = 4096;
-        else
-            new_capacity = sb->cap * 2;
+        else // TODO: Align to page size
+            new_capacity = sb->len * 2;
 
         if (streambuf_ensure_capacity(sb, new_capacity) < 0)
             return -1;
