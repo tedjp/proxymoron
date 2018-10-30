@@ -1243,8 +1243,6 @@ static void enable_defer_accept(int sock) {
 #endif
 }
 
-// This is not really necessary on modern Linux kernels; they do server-side
-// fastopen by default.
 static void enable_fastopen_on_listener(int sock) {
 #if defined(TCP_FASTOPEN)
     const int queue_len = 100;
