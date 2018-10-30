@@ -48,6 +48,9 @@
 
 #define MAX_REQUEST_SIZE 65536
 #define MAX_PIPELINED_REQUEST_DATA (MAX_REQUEST_SIZE * 4)
+// Should be at least 2 to handle long-lived keep-alive connections dropped by
+// middleboxes.
+#define MAX_CONNECT_ATTEMPTS 2u
 
 __attribute__((noreturn))
 static void fatal_perror(const char *msg) {
@@ -116,7 +119,11 @@ struct job {
     struct {
         const char *data;
         size_t len;
+        size_t remaining_len; // how much remains to send on *this* connection attempt
+        // When using this field, start at data + (len - remaining_len) (sorry)
     } backend_request;
+
+    unsigned connect_attempts;
 };
 
 // Advance the current data location / consume a block of data.
@@ -147,6 +154,10 @@ static void streambuf_free_contents(struct streambuf *streambuf) {
     streambuf->cap = 0;
 }
 
+static void streambuf_clear_contents(struct streambuf *streambuf) {
+    streambuf->len = 0;
+}
+
 static bool endpoint_init(struct endpoint *ep) {
     ep->fd = -1;
 
@@ -169,6 +180,13 @@ static void endpoint_free_contents(struct endpoint *ep) {
 
     streambuf_free_contents(&ep->incoming);
     streambuf_free_contents(&ep->outgoing);
+}
+
+static void endpoint_clear_contents(struct endpoint *ep) {
+    ep->fd = -1;
+
+    streambuf_clear_contents(&ep->incoming);
+    streambuf_clear_contents(&ep->outgoing);
 }
 
 static int endpoint_flush(struct endpoint *ep) {
@@ -364,6 +382,11 @@ static struct job *new_job(int client) {
     if (j == NULL)
         return NULL;
 
+    j->connect_attempts = 0;
+    j->backend_request.data = NULL;
+    j->backend_request.len = 0;
+    j->backend_request.remaining_len = 0;
+
     if (endpoint_init(&j->client) == false) {
         free(j);
         return NULL;
@@ -420,42 +443,104 @@ static void setup_connection_pool(struct connection_pool *pool) {
     }
 }
 
-static int pool_new_connection(struct connection_pool *pool) {
+static void enable_fastopen_connect(int sock) {
+// This can't just be conditional; we rely on the sendto() for connection
+// establishment & initial send. An implementation without FASTOPEN_CONNECT will
+// ignore our MSG_FASTOPEN flag and not actually send the request. (And we have
+// no facility to explicitly attempt the send afterwards.)
+#if !defined(TCP_FASTOPEN_CONNECT)
+# error "TCP_FASTOPEN_CONNECT is required"
+#endif
+    const int yes = 1;
+    if (setsockopt(sock, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &yes, sizeof(yes)) == -1)
+        fatal_perror("setsockopt(TCP_FASTOPEN_CONNECT)");
+}
+
+static ssize_t pool_new_connection_fastopen(
+        struct connection_pool *pool,
+        const void *data,
+        size_t len,
+        int *fdp)
+{
     // FIXME: Iterate over addresses
     // (a little tricker with non-blocking connect)
     struct addrinfo *addr = pool->addrs;
 
     int sock = socket(addr->ai_family, addr->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, addr->ai_protocol);
     if (sock == -1) {
+        int save_errno = errno;
         perror("Failed to allocate connection pool socket\n");
+        errno = save_errno;
         return -1;
     }
 
-    if (connect(sock, addr->ai_addr, addr->ai_addrlen) == -1 && errno != EINPROGRESS) {
-        perror("Failed to connect to backend");
+    enable_fastopen_connect(sock);
+
+    // connect() (TCP Fast Open)
+    ssize_t sent = sendto(sock, data, len, MSG_FASTOPEN, addr->ai_addr, addr->ai_addrlen);
+    if (sent == -1 && (errno != EINPROGRESS && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        int save_errno = errno;
+        perror("Failed to fastopen connect to backend");
         close(sock);
+        errno = save_errno;
         return -1;
     }
 
-    return sock;
-}
-
-static int pool_get_fd(struct connection_pool *pool) {
+    *fdp = sock;
     ++pool->in_use_count;
 
-    if (pool->head != NULL) {
-        --pool->idle_count;
+    return sent;
+}
 
-        struct cpool_node *n = pool->head;
+// Optimized version of pool_delete_fd if the caller knows that the file was not
+// on the idle list.
+static void pool_delete_active_fd(struct connection_pool *pool, int fd __attribute__((unused))) {
+    --pool->in_use_count;
+}
 
-        pool->head = n->next;
+static int pool_get_idle_fd(struct connection_pool *pool) {
+    if (pool->head == NULL)
+        return -1;
 
-        int fd = n->fd;
-        free(n);
-        return fd;
+    --pool->idle_count;
+
+    struct cpool_node *n = pool->head;
+
+    pool->head = n->next;
+
+    int fd = n->fd;
+    free(n);
+
+    return fd;
+}
+
+static ssize_t pool_get_fd_fastopen(
+        struct connection_pool *pool,
+        const void *data,
+        size_t len,
+        int *fdp)
+{
+    int fd = -1;
+
+    while ((fd = pool_get_idle_fd(pool)) != -1) {
+        ssize_t sent = send(fd, data, len, MSG_DONTWAIT);
+
+        if (sent >= 0 || (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            // Socket seems good.
+            ++pool->in_use_count;
+            *fdp = fd;
+            return sent;
+        }
+
+        if (sent == -1) {
+            // fd is bad
+            pool_delete_active_fd(pool, fd);
+            close(fd);
+            fd = -1;
+        }
     }
 
-    return pool_new_connection(pool);
+    return pool_new_connection_fastopen(pool, data, len, fdp);
 }
 
 static void subscribe(int epfd, int fd) {
@@ -470,86 +555,37 @@ static void subscribe(int epfd, int fd) {
         fatal_perror("epoll_ctl subscribe");
 }
 
-static int get_backend_fd(int epfd, struct connection_pool *pool) {
-    int fd = pool_get_fd(pool);
-    if (fd == -1)
-        return -1;
-
-    subscribe(epfd, fd);
-
-    return fd;
-}
-
-static struct cpool_node *new_pool_node(int fd) {
-    struct cpool_node *n = calloc(1, sizeof(*n));
-    n->fd = fd;
-    n->next = NULL;
-    return n;
-}
-
-static void pool_release_fd(struct connection_pool *pool, int fd) {
-    --pool->in_use_count;
-    ++pool->idle_count;
-
-    // prepend node to list.
-    struct cpool_node *n = new_pool_node(fd);
-    n->next = pool->head;
-    pool->head = n;
-}
-
 static void unsubscribe(int epfd, int fd) {
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) == -1)
         perror("epoll_ctl DEL");
 }
 
-static void release_backend_fd(int epfd, struct connection_pool *pool, int fd) {
-    unsubscribe(epfd, fd);
-    pool_release_fd(pool, fd);
-}
+// use get_backend_fd_and_send to correctly track unsent bytes;
+// it calls this.
+static ssize_t get_backend_fd_fastopen(
+        int epfd,
+        struct connection_pool *pool,
+        const void *data,
+        size_t len,
+        int *fdp)
+{
+    ssize_t sent = pool_get_fd_fastopen(pool, data, len, fdp);
+    if (sent == -1 && errno != EINPROGRESS && errno != EAGAIN && errno != EWOULDBLOCK)
+        return -1;
 
-// Optimized version of pool_delete_fd if the caller knows that the file was not
-// on the idle list.
-static void pool_delete_active_fd(struct connection_pool *pool, int fd __attribute__((unused))) {
-    --pool->in_use_count;
-}
+    int save_errno = errno;
 
-// Prefer pool_delete_active_fd() if possible
-__attribute__((unused))
-static void pool_delete_fd(struct connection_pool *pool, int fd) {
-    // Figure out whether it was in use or idle
-    for (struct cpool_node *n = pool->head; n != NULL; n = n->next) {
-        if (n->fd == fd) {
-            --pool->idle_count;
-            return;
-        }
-    }
+    subscribe(epfd, *fdp);
 
-    pool_delete_active_fd(pool, fd);
+    errno = save_errno;
+
+    return sent;
 }
 
 static void delete_backend_fd(int epfd, struct connection_pool *pool, int fd) {
     unsubscribe(epfd, fd);
     pool_delete_active_fd(pool, fd);
-}
-
-// Returns new length, or -1 on error
-static ssize_t replace_string(char *buf, size_t buflen, size_t bufcap, const char *from, size_t fromlen, const char *to, size_t tolen) {
-    if (buflen - fromlen + tolen > bufcap)
-        return -1;
-
-    char *location = memmem(buf, buflen, from, fromlen);
-    if (location == NULL)
-        return -1;
-
-    const size_t trailer_len = buflen - (location - buf) - fromlen;
-
-    // shift keep-memory
-    memmove(location + tolen, location + fromlen, trailer_len);
-
-    // replace
-    memcpy(location, to, tolen);
-
-    return buflen - fromlen + tolen;
+    close(fd);
 }
 
 struct free_job_node {
@@ -595,13 +631,109 @@ static void close_job(int epfd, struct job *job) {
         // request in HTTP/1.1. Waiting for it and draining it is a waste
         // of time (potentially bigger).
         delete_backend_fd(epfd, &backend_pool, job->backend.fd);
-        close(job->backend.fd);
         job->backend.fd = -1;
     }
 
     endpoint_free_contents(&job->backend);
 
     free_job_later(job);
+}
+
+static void to_next_state(int epfd, struct job *job);
+
+static int get_backend_fd_and_send(int epfd, struct job *job) {
+    assert(job->connect_attempts <= MAX_CONNECT_ATTEMPTS);
+
+    // TODO: Need to add a free connection attempt whenever an idle-pool fd is
+    // used, because it might already have turned to trash (not the fault of
+    // this iteration).
+    if (job->connect_attempts >= MAX_CONNECT_ATTEMPTS) {
+        // Here's a reminder to allow a free attempt.
+        fprintf(stderr, "Exceeded %u connection attempts\n", MAX_CONNECT_ATTEMPTS);
+        return -1;
+    }
+
+    ++job->connect_attempts;
+
+    int fd = -1;
+
+    ssize_t sent = get_backend_fd_fastopen(
+            epfd,
+            &backend_pool,
+            job->backend_request.data,
+            job->backend_request.len,
+            &fd);
+
+    if (sent == -1) {
+        if (errno == EINPROGRESS || errno == EAGAIN || errno == EWOULDBLOCK) {
+            assert(fd != -1);
+            return fd;
+        }
+
+        return -1;
+    }
+
+    assert(fd != -1);
+
+    job->backend_request.remaining_len -= sent;
+
+    return fd;
+}
+
+static struct cpool_node *new_pool_node(int fd) {
+    struct cpool_node *n = calloc(1, sizeof(*n));
+    n->fd = fd;
+    n->next = NULL;
+    return n;
+}
+
+static void pool_release_fd(struct connection_pool *pool, int fd) {
+    --pool->in_use_count;
+    ++pool->idle_count;
+
+    // prepend node to list.
+    struct cpool_node *n = new_pool_node(fd);
+    n->next = pool->head;
+    pool->head = n;
+}
+
+static void release_backend_fd(int epfd, struct connection_pool *pool, int fd) {
+    unsubscribe(epfd, fd);
+    pool_release_fd(pool, fd);
+}
+
+// Prefer pool_delete_active_fd() if possible
+__attribute__((unused))
+static void pool_delete_fd(struct connection_pool *pool, int fd) {
+    // Figure out whether it was in use or idle
+    for (struct cpool_node *n = pool->head; n != NULL; n = n->next) {
+        if (n->fd == fd) {
+            --pool->idle_count;
+            return;
+        }
+    }
+
+    pool_delete_active_fd(pool, fd);
+}
+
+// Returns new length, or -1 on error
+static ssize_t replace_string(char *buf, size_t buflen, size_t bufcap, const char *from, size_t fromlen, const char *to, size_t tolen) {
+    if (buflen - fromlen + tolen > bufcap)
+        return -1;
+
+    char *location = memmem(buf, buflen, from, fromlen);
+    if (location == NULL)
+        return -1;
+
+    const size_t trailer_len = buflen - (location - buf) - fromlen;
+
+    // shift keep-memory
+    memmove(location + tolen, location + fromlen, trailer_len);
+
+    // replace
+    memcpy(location, to, tolen);
+
+    return buflen - fromlen + tolen;
 }
 
 static void ep_mod_or_cleanup(int epfd, int fd, struct epoll_event *event) {
@@ -630,18 +762,24 @@ static void notify_when_writable(int epfd, struct job *job, int fd) {
     ep_mod_or_cleanup(epfd, fd, &event);
 }
 
-static void discard_request_data(struct job *job) {
-    streambuf_advance(&job->client.incoming, job->backend_request.len);
-
+static void clear_backend_request(struct job *job) {
     job->backend_request.data = NULL;
     job->backend_request.len = 0;
+    job->backend_request.remaining_len = 0;
+}
+
+static void discard_request_data(struct job *job) {
+    streambuf_advance(&job->client.incoming, job->backend_request.len);
+    clear_backend_request(job);
 }
 
 static enum state job_state(struct job *job) {
     if (job->client.outgoing.len > 0)
         return FRONTEND_WRITE_WAIT;
 
-    if (job->backend.outgoing.len > 0)
+    // This one is different; it writes straight from the backend_request
+    // pointer (which actually points into the client.incoming buffer).
+    if (job->backend_request.remaining_len > 0)
         return BACKEND_WRITE_WAIT;
 
     if (job->backend.fd != -1)
@@ -671,7 +809,10 @@ static void poll_appropriate_fd(int epfd, struct job *job) {
     }
 }
 
+// reset the job structure
 static void finished_with_previous_request(int epfd, struct job *job) {
+    job->connect_attempts = 0;
+
     discard_request_data(job);
 
     // Don't accidentally close the backend fd, just unsubscribe.
@@ -680,7 +821,7 @@ static void finished_with_previous_request(int epfd, struct job *job) {
         job->backend.fd = -1;
     }
 
-    endpoint_free_contents(&job->backend);
+    endpoint_clear_contents(&job->backend);
 }
 
 // This is meant to be a specialized, faster alternative to
@@ -709,11 +850,11 @@ static char *find_end_of_header(char *buf, size_t len) {
     return NULL;
 }
 
-static bool send_backend_request(int epfd, struct job *job) {
-    return endpoint_send(&job->backend, job->backend_request.data, job->backend_request.len) != -1;
+static void setup_backend_request(struct job *job, const char *end_of_request_header) {
+    job->backend_request.data = job->client.incoming.data;
+    job->backend_request.len = end_of_request_header - job->client.incoming.data;
+    job->backend_request.remaining_len = job->backend_request.len;
 }
-
-static void to_next_state(int epfd, struct job *job);
 
 static void on_client_input(int epfd, struct job *job) {
     ssize_t len = endpoint_recv(&job->client, MAX_PIPELINED_REQUEST_DATA);
@@ -763,28 +904,43 @@ static void on_client_input(int epfd, struct job *job) {
         return;
     }
 
-    // Keep reference to the request in case we need to retry
-    job->backend_request.data = job->client.incoming.data;
-    job->backend_request.len = end_of_request_header - job->client.incoming.data;
+    setup_backend_request(job, end_of_request_header);
 
     // Grab a backend connection
-    endpoint_free_contents(&job->backend);
-    job->backend.fd = get_backend_fd(epfd, &backend_pool);
+    endpoint_clear_contents(&job->backend);
+    job->backend.fd = get_backend_fd_and_send(epfd, job);
 
     if (job->backend.fd == -1) {
+        clear_backend_request(job);
         job_respond_status_only(job, 503, "Backend unavailable");
         to_next_state(epfd, job);
         return;
     }
 
-    // jump straight to attempting backend write
-    if (send_backend_request(epfd, job) == false) {
-        job_respond_status_only(job, 503, "Backend write failed");
+    to_next_state(epfd, job);
+}
+
+static void send_backend_request(int epfd, struct job *job) {
+    ssize_t sent = send(
+                job->backend.fd,
+                job->backend_request.data + (job->backend_request.len - job->backend_request.remaining_len),
+                job->backend_request.remaining_len,
+                MSG_DONTWAIT);
+    if (sent == -1 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
+        if (job_respond_status_only(job, 503, "Backend send failed") == -1) {
+            close_job(epfd, job);
+            return;
+        }
+
         to_next_state(epfd, job);
         return;
     }
 
-    to_next_state(epfd, job);
+    if (sent == -1)
+        return;
+
+    assert(sent <= job->backend_request.remaining_len);
+    job->backend_request.remaining_len -= sent;
 }
 
 static void state_to_backend_write(int epfd, struct job *job) {
@@ -803,8 +959,7 @@ static void state_to_client_read(int epfd, struct job *job) {
     finished_with_previous_request(epfd, job);
 
     // If there's data in the pipe go inspect it to see if it contains a full
-    // request already (eg. pipelined request). Otherwise we'd get stuck waiting
-    // for data forever when the client has already sent all its requests.
+    // request already (eg. pipelined request).
 
     if (job->client.incoming.len > 0) {
         on_client_input(epfd, job);
@@ -913,10 +1068,16 @@ static void read_backend_response(int epfd, struct job *job) {
         fprintf(stderr, "Backend fd %d was trash (%s); replacing\n",
                 job->backend.fd,
                 len == 0 ? "connection closed" : strerror(errno));
+
         delete_backend_fd(epfd, &backend_pool, job->backend.fd);
-        job->backend.fd = get_backend_fd(epfd, &backend_pool);
+
+        job->backend_request.remaining_len = job->backend_request.len;
+
+        job->backend.fd = get_backend_fd_and_send(epfd, job);
 
         if (job->backend.fd == -1) {
+            clear_backend_request(job);
+
             if (job_respond_status_only(job, 503, "Backend unavailable (for real)") == -1) {
                 close_job(epfd, job);
                 return;
@@ -924,14 +1085,6 @@ static void read_backend_response(int epfd, struct job *job) {
 
             to_next_state(epfd, job);
             return;
-        }
-
-        // resend backend request on new connection
-        if (send_backend_request(epfd, job) == false) {
-            if (job_respond_status_only(job, 503, "Backend request failed again") == -1) {
-                close_job(epfd, job);
-                return;
-            }
         }
 
         to_next_state(epfd, job);
@@ -986,13 +1139,11 @@ static void read_event(int epfd, struct job *job) {
 static void write_event(int epfd, const struct epoll_event *event) {
     struct job *job = event->data.ptr;
 
-    if (job->client.outgoing.len > 0) {
+    if (job->client.outgoing.len > 0)
         endpoint_flush(&job->client);
-    }
 
-    if (job->backend.outgoing.len > 0) {
-        endpoint_flush(&job->backend);
-    }
+    if (job->backend_request.remaining_len > 0)
+        send_backend_request(epfd, job);
 
     to_next_state(epfd, job);
 }
@@ -1040,24 +1191,6 @@ static void new_client(int epfd, struct job *listen_job) {
     on_client_input(epfd, job);
 }
 
-static void on_hup_or_error(int epfd, const struct epoll_event *event) {
-    struct job *job = event->data.ptr;
-
-    if (job->backend.fd != -1) {
-        delete_backend_fd(epfd, &backend_pool, job->backend.fd);
-
-        if (job_respond_status_only(job, 503, "Backend connection lost") == -1) {
-            close_job(epfd, job);
-            return;
-        }
-
-        to_next_state(epfd, job);
-        return;
-    }
-
-    close_job(epfd, job);
-}
-
 static void dispatch(int epfd, const struct epoll_event *event, int listensock) {
     if (event->events & EPOLLIN) {
         struct job *job = event->data.ptr;
@@ -1075,9 +1208,6 @@ static void dispatch(int epfd, const struct epoll_event *event, int listensock) 
         // Client already closed
         return;
     }
-
-    if ((event->events & EPOLLHUP) || (event->events & EPOLLERR))
-        on_hup_or_error(epfd, event);
 }
 
 static void multiply() {
@@ -1110,7 +1240,9 @@ static void enable_defer_accept(int sock) {
 #endif
 }
 
-static void enable_fastopen(int sock) {
+// This is not really necessary on modern Linux kernels; they do server-side
+// fastopen by default.
+static void enable_fastopen_on_listener(int sock) {
 #if defined(TCP_FASTOPEN)
     const int queue_len = 100;
     if (setsockopt(sock, IPPROTO_TCP, TCP_FASTOPEN, &queue_len, sizeof(queue_len)) == -1)
@@ -1149,7 +1281,7 @@ static int server_socket(void) {
     // nodelay seems to reduce throughput. leave it off for now.
     //enable_nodelay(sock);
 
-    enable_fastopen(sock);
+    enable_fastopen_on_listener(sock);
 
     if (listen(sock, 1000) == -1)
         fatal_perror("listen");
