@@ -443,6 +443,10 @@ static void setup_connection_pool(struct connection_pool *pool) {
     }
 }
 
+static unsigned connection_pool_idle_count(struct connection_pool *pool) {
+    return pool->idle_count;
+}
+
 static void enable_fastopen_connect(int sock) {
 // This can't just be conditional; we rely on the sendto() for connection
 // establishment & initial send. An implementation without FASTOPEN_CONNECT will
@@ -644,18 +648,17 @@ static void to_next_state(int epfd, struct job *job);
 static int get_backend_fd_and_send(int epfd, struct job *job) {
     assert(job->connect_attempts <= MAX_CONNECT_ATTEMPTS);
 
-    // TODO: Need to add a free connection attempt whenever an idle-pool fd is
-    // used, because it might already have turned to trash (not the fault of
-    // this iteration).
-    if (job->connect_attempts >= MAX_CONNECT_ATTEMPTS) {
-        // Here's a reminder to allow a free attempt.
-        fprintf(stderr, "Exceeded %u connection attempts\n", MAX_CONNECT_ATTEMPTS);
+    if (job->connect_attempts >= MAX_CONNECT_ATTEMPTS)
         return -1;
-    }
-
-    ++job->connect_attempts;
 
     int fd = -1;
+
+    if (connection_pool_idle_count(&backend_pool) == 0) {
+        // Only if the idle pool was empty should we count this as a new
+        // connection attempt. Otherwise a bunch of idle connections with broken
+        // pipes would be pinned on us and fail the request.
+        ++job->connect_attempts;
+    }
 
     ssize_t sent = get_backend_fd_fastopen(
             epfd,
