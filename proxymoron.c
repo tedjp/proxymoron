@@ -447,17 +447,26 @@ static unsigned connection_pool_idle_count(struct connection_pool *pool) {
     return pool->idle_count;
 }
 
-static void enable_fastopen_connect(int sock) {
-// This can't just be conditional; we rely on the sendto() for connection
-// establishment & initial send. An implementation without FASTOPEN_CONNECT will
-// ignore our MSG_FASTOPEN flag and not actually send the request. (And we have
-// no facility to explicitly attempt the send afterwards.)
-#if !defined(TCP_FASTOPEN_CONNECT)
-# error "TCP_FASTOPEN_CONNECT is required"
-#endif
+static void try_to_enable_fastopen_connect(int sock) {
+#if defined(TCP_FASTOPEN_CONNECT)
     const int yes = 1;
     if (setsockopt(sock, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &yes, sizeof(yes)) == -1)
         fatal_perror("setsockopt(TCP_FASTOPEN_CONNECT)");
+#endif
+}
+
+static ssize_t connect_and_try_to_send(
+        int sock,
+        const struct sockaddr *addr,
+        socklen_t addrlen,
+        const void *data,
+        size_t len)
+{
+#if defined(TCP_FASTOPEN_CONNECT)
+    return sendto(sock, data, len, MSG_FASTOPEN, addr, addrlen);
+#else
+    return connect(sock, addr, addrlen);
+#endif
 }
 
 static ssize_t pool_new_connection_fastopen(
@@ -478,13 +487,17 @@ static ssize_t pool_new_connection_fastopen(
         return -1;
     }
 
-    enable_fastopen_connect(sock);
+    try_to_enable_fastopen_connect(sock);
 
-    // connect() (TCP Fast Open)
-    ssize_t sent = sendto(sock, data, len, MSG_FASTOPEN, addr->ai_addr, addr->ai_addrlen);
+    // connect() (maybe TCP Fast Open)
+    ssize_t sent = connect_and_try_to_send(sock, addr->ai_addr, addr->ai_addrlen, data, len);
     if (sent == -1 && (errno != EINPROGRESS && errno != EAGAIN && errno != EWOULDBLOCK)) {
         int save_errno = errno;
+#if defined(TCP_FASTOPEN_CONNECT)
         perror("Failed to fastopen connect to backend");
+#else
+        perror("Failed to connect to backend");
+#endif
         close(sock);
         errno = save_errno;
         return -1;
