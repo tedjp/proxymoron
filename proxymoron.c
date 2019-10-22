@@ -615,6 +615,11 @@ static void free_closed_jobs() {
 }
 
 static void free_job_later(struct job *job) {
+    for (struct free_job_node *n = free_jobs; n != NULL; n = n->next) {
+        if (n->job == job)
+            return; // already queued
+    }
+
     struct free_job_node *n = malloc(sizeof(*n));
     n->job = job;
     n->next = free_jobs;
@@ -1147,6 +1152,11 @@ static void write_event(int epfd, const struct epoll_event *event) {
 
     if (job->backend_request.remaining_len > 0)
         send_backend_request(epfd, job);
+
+    if (job->client.fd == -1) {
+        close_job(epfd, job);
+        return;
+    }
 
     to_next_state(epfd, job);
 }
